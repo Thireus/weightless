@@ -18,7 +18,11 @@ services:
     container_name: deepseek-v4-flash-vision-vl-dspark-1
     network_mode: host
     ipc: host
-    restart: "no"
+    # unless-stopped: an EngineDeadError (e.g. one slow/hung step past the
+    # worker-response timeout) exits the API server; without a restart policy
+    # the lane stays dark until a manual serve. Auto-recover instead — the
+    # memory watchdog and fail-closed hotfix already gate a bad boot.
+    restart: unless-stopped
     shm_size: "64gb"
 
     ulimits:
