@@ -17,16 +17,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LISTEN = ("0.0.0.0", 8000)
 UPSTREAM_HOST = "127.0.0.1"
 
-# lane model id -> upstream port (see weightless/recipe/*/.env.*)
+# lane model id -> (upstream port, upstream model id or None to pass through).
+# Aliases rewrite the request's model field so old client configs keep working.
+GLM53_TP4 = "nvidia/GLM-5.3-Flash-NVFP4"   # GLM-5.3-Flash NVFP4 + GLP-44, TP=4 ring, rank0 on :8888
 ROUTES = {
-    "qwen38-nvfp4": 8078,                # Qwen3.8-27B NVFP4, 1x Spark
-    "qwen38-flash-next-nvfp4": 8079,     # Qwen3.8-Flash-Next NVFP4, TP=2
-    "glm53-flash": 8080,                 # GLM-5.3-Flash NVFP4, TP=2
-    "glm-5.3": 8081,                     # GLM-5.3 743B, TP=4
-    "inkling-small-nvfp4": 8082,         # Inkling-Small NVFP4, TP=2
-    "deepseek-v4-flash-dspark": 8888,    # DSV4 Flash 0731 NVFP4, TP=2
-    "deepseek-v4-flash-vision-exp-dspark": 8888,  # DSV4 Vision-Exp text-only FP8, TP=2 (same port: lanes swap)
-    "deepseek-v4-flash-vision-vl-dspark": 8888,   # DSV4 Vision-Exp VL (vision tower), TP=2 (same port: lanes swap)
+    GLM53_TP4: (8888, None),                    # canonical upstream id
+    "glm53-flash-tp4": (8888, GLM53_TP4),       # friendly alias
+    # retired DSV4 TP=2 lanes (2026-09-29: replaced by the TP=4 GLM ring) — alias so
+    # existing hermes/omp configs pointing at them keep being served:
+    "deepseek-v4-flash-dspark": (8888, GLM53_TP4),
+    "deepseek-v4-flash-vision-exp-dspark": (8888, GLM53_TP4),
+    "deepseek-v4-flash-vision-vl-dspark": (8888, GLM53_TP4),
 }
 
 HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te",
@@ -36,7 +37,7 @@ HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te",
 def upstream_models():
     """Merge /v1/models from every lane that answers within 1s."""
     out = []
-    for port in sorted(set(ROUTES.values())):
+    for port in sorted({p for p, _ in ROUTES.values()}):
         c = http.client.HTTPConnection(UPSTREAM_HOST, port, timeout=1)
         try:
             c.request("GET", "/health")
@@ -95,12 +96,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as error:
             self._send_json(400, {"error": str(error)})
             return
-        port = ROUTES.get(model)
-        if port is None:
+        route = ROUTES.get(model)
+        if route is None:
             self._send_json(400, {
                 "error": f"unknown or missing model {model!r}; "
                          f"known lanes: {sorted(ROUTES)}"})
             return
+        port, upstream_model = route
+        if upstream_model and upstream_model != model:
+            payload["model"] = upstream_model
+            body = json.dumps(payload).encode()
         try:
             c = http.client.HTTPConnection(UPSTREAM_HOST, port, timeout=None)
             hdrs = {k: v for k, v in self.headers.items()
