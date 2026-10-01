@@ -2494,11 +2494,17 @@ def remote_diagnose(io, host):
     probe = (
         "echo '== containers =='; "
         "docker ps -a --format '{{.Names}} {{.Status}}' "
-        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron' || echo '(no serving container)'; "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless' || echo '(no serving container)'; "
         "echo '== restart-counts =='; "
         "docker inspect -f '{{.Name}} {{.State.Status}} restarts={{.RestartCount}}' "
         "$(docker ps -aq) 2>/dev/null "
-        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron' || true; "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless' || true; "
+        "echo '== wedge-signature =='; "
+        "for c in $(docker ps -aq --format '{{.Names}}' "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless'); do "
+        "docker logs --tail 300 $c 2>&1 "
+        "| grep -m2 -E 'ring transport failed|runtime poisoned|EngineDeadError|RPC call.*timed out' "
+        "| sed \"s|^|$c: |\"; done; true; "
         "echo '== fabric =='; "
         "ip -br addr 2>/dev/null | grep -E '192\\.168\\.100' || echo '(no fabric address on this node)'; "
         "echo '== peers =='; "
@@ -2530,6 +2536,14 @@ def remote_diagnose(io, host):
     if "(no fabric address on this node)" in out:
         io.err("fabric: this node has NO 192.168.100.x address — the inter-Spark "
                "link is down on this side (NO-CARRIER class)")
+    # Application wedge (2026-10-01): GPU work hangs (kda ring-transport wait
+    # timeout), workers exit cleanly, container shows Exited (0) — no watchdog,
+    # sysctl, or restart policy fires because the OS is healthy.
+    if "ring transport failed" in out or "EngineDeadError" in out:
+        io.err("application wedge: GPU work hung and the stack exited cleanly "
+               "(ring-transport / engine-RPC timeout signature) — the box is "
+               "healthy, so no self-healing fires. Relaunch the lane through "
+               "its start script (RoCE GIDs re-resolve there), NOT docker restart")
     down = [p for p in peers if f"{p} DOWN" in out]
     if down:
         io.err(f"peer(s) unreachable: {', '.join(down)} — the node is off or "

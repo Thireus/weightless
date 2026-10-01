@@ -10,6 +10,20 @@ fabric, peers, GPU) and interprets what it finds.
 
 Symptom → likely cause, in the order to check:
 
+0. **Containers `Exited (0)` minutes ago, box healthy, no restarts** —
+   application wedge (first seen 2026-10-01, glm53tp4 lane): GPU work hung
+   under load (`prefill ring transport failed: GPU wait timed out … runtime
+   poisoned` in the wedged rank's log, kda_fp8_handoff), that rank's worker
+   exited, and the head rank followed ~5 min later with `EngineDeadError`
+   (`RPC call … timed out`). Everything exits **0**, so the hardware
+   watchdog, wedge-heal sysctls, and docker restart policies never fire —
+   the box is fine, only the stack died. Recover by relaunching the lane
+   through its start script (RoCE GID indices re-resolve there), never
+   `docker start`. The wizard's diagnose greps the last 300 log lines of
+   serving containers for this signature. Open gap: no container-level
+   watchdog yet — a cron checking `/v1/models` and relaunching the lane
+   would close it.
+
 1. **Router answers but serves zero models** — the serving engine behind it
    is down, the router is fine. Diagnose falls through to the node check
    automatically.
