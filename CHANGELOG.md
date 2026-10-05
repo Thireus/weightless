@@ -4,6 +4,23 @@ Date-based sections — the repo has no versioned releases yet; captain-vector
 carries its own version numbers. Newest first. Steering-effectiveness numbers
 live in `BENCHMARK.md`; this file tracks what shipped.
 
+## 2026-10-05
+
+### Changed
+- **`sglang-plugin/` serves SGLang's stage-boundary layer layout**
+  (`sglang.srt.layers.layer_boundary`, SGLang main since 2026-09-30) next
+  to the older one, picked per rank from what the layers hold. Qwen3.8-27B
+  steers through the forward batch's residual stream; GLM-5.3-Flash steers
+  the feed-forward post-combine inside the FFN boundary's mHC update. Same
+  stream, same edit, same bits as on the older layout (CPU, SGLang's real
+  model classes on both layouts, pipeline ranks included).
+- Ranks come from SGLang's ModelRunner or `get_parallel()`; with neither,
+  the boot stops instead of assuming rank 0 of 1. The fired check also
+  fails a site that ran twice in one forward. Rows not ported yet
+  (GLM-5.3, Hy4-preview, Qwen3.8-Flash-Next, Nemotron-3.5-Lightning,
+  Nanbeige) are refused on stage-boundary trees. 407 CPU tests. Details:
+  `sglang-plugin/README.md`, "SGLang layouts".
+
 ## 2026-10-04
 
 ### Added

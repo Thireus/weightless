@@ -22,6 +22,15 @@ wrapping off again. A handler must wrap an INSTANCE attribute, never a
 class, and must raise if the attribute it wraps is missing or has another
 shape than the row expects: the boot then stops. ``site`` is the text
 written to the log line and the manifest.
+
+SGLang's stage-boundary layers (``core.stage_boundaries``: the layer holds
+``attn_boundary`` and ``ffn_boundary``) keep the residual in the forward
+batch, not in the layer's output. A row serves them only when it says so
+(``ArchRow.boundary``); every other row refuses such a layer at install,
+before anything is hooked. A "hook" row with ``boundary`` gets the
+residual-stream codec (``core.make_stream_hook``); a special handler that
+serves them names its site there with ``boundary_site=...`` and installs
+itself on either layout, choosing by what the layer holds.
 """
 from __future__ import annotations
 
@@ -71,6 +80,8 @@ class ArchRow:
     loop            looped rows only: config -> LoopSpec (layers per loop
                     pass, passes, and where the loop index is in the
                     layer's call); see nanbeige.py.
+    boundary        the row also serves SGLang's stage-boundary layers
+                    (see the module text). False: such a layer is refused.
     """
 
     backbone: tuple
@@ -88,6 +99,7 @@ class ArchRow:
     hint: frozenset = frozenset()
     kind: Optional[Callable] = None
     loop: Optional[Callable] = None
+    boundary: bool = False
 
 
 def hidden_size(cfg):
@@ -95,13 +107,18 @@ def hidden_size(cfg):
 
 
 SPECIAL = {}
+# special handler name -> the site text on stage-boundary layers, for the
+# handlers that serve them (``register_special(..., boundary_site=...)``)
+BOUNDARY_SITE = {}
 
 
-def register_special(name, *, site):
+def register_special(name, *, site, boundary_site=None):
     def deco(fn):
         if name in SPECIAL:
             raise RuntimeError(f"weightless: special install handler {name!r} registered twice")
         SPECIAL[name] = (fn, site)
+        if boundary_site is not None:
+            BOUNDARY_SITE[name] = boundary_site
         return fn
 
     return deco

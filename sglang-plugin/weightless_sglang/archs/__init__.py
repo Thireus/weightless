@@ -15,7 +15,7 @@ DeepSeek-V4 residual-site file.
 from __future__ import annotations
 
 from . import dsv4, glm5next, glm53xl, hy4, kimi_k3, nanbeige, nemotron_h, qwen38, qwen38fn
-from .base import PREFLIGHT, SPECIAL  # noqa: F401  (install.py reads them here)
+from .base import BOUNDARY_SITE, PREFLIGHT, SPECIAL  # noqa: F401  (install.py reads them here)
 
 # Served model class name (exact) -> row. Anything else fails closed.
 ARCH = {

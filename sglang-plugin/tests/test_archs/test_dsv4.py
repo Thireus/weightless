@@ -834,8 +834,15 @@ def cpu_runtime():
                 (D, "check_cuda_graph_backend", lambda *a, **k: True),
                 (D, "dsa_use_prefill_cp", lambda fb: False),
                 (MOE, "is_tbo_enabled", lambda: False)):
+            if name in _GONE_ON_SOME_TREES and not hasattr(obj, name):
+                continue  # 15aa0b5a: the CP gate is is_cp_active(forward_batch), see _fb()
             st.enter_context(mock.patch.object(obj, name, val))
         yield
+
+
+# Names cpu_runtime stubs that a newer SGLang no longer has (the stub is then
+# not needed): deepseek_v4.dsa_use_prefill_cp is gone on 15aa0b5a.
+_GONE_ON_SOME_TREES = frozenset({"dsa_use_prefill_cp"})
 
 
 def _cfg():
@@ -954,9 +961,13 @@ def real_runner(partition=(NL,), rank=0, dtype=torch.float32, fused=True):
 
 
 def _fb():
+    # is_context_parallel_extend: read by layers/cp/utils.is_cp_active, the CP gate of the
+    # model's two-batch-overlap check on 15aa0b5a (one rank here: never CP)
     return types.SimpleNamespace(can_run_tbo=False, tbo_children=None, global_forward_mode=None,
                                  attn_cp_metadata=None, num_token_non_padded=None,
-                                 forward_mode=types.SimpleNamespace(is_idle=lambda: False))
+                                 forward_mode=types.SimpleNamespace(
+                                     is_idle=lambda: False,
+                                     is_context_parallel_extend=lambda: False))
 
 
 def run_model(run, x=None, proxy=None):

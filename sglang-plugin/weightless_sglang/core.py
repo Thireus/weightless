@@ -1,10 +1,14 @@
 """The GLP edit at one steering site, the tuple codec around it, the
-per-forward check that every site fired, and the forward wrapper used where
-a model loop calls ``layer.forward(...)``. Pure torch.
+residual-stream codec for SGLang's stage-boundary layers, the per-forward
+check that every site fired, and the forward wrapper used where a model
+loop calls ``layer.forward(...)``. Pure torch.
 
 Many SGLang decoder layers return ``(hidden, residual)``. The add of the two
 is left to the next layer's fused add+RMSNorm, so the stream after layer i
-is ``h = hidden + residual``. The vLLM plugin (vllm-plugin archs/base.py,
+is ``h = hidden + residual``. Layers built from SGLang's stage boundaries
+(``sglang.srt.layers.layer_boundary``, see ``stage_boundaries`` below)
+return ``hidden`` alone and keep ``residual`` in the forward batch's
+residual stream; the stream after layer i is the same sum. The vLLM plugin (vllm-plugin archs/base.py,
 _steer_post_layer) projects h and writes back ``hidden <- h' - residual``.
 Here the same edit is written in its delta form, computed in fp32 and
 rounded once:
@@ -180,14 +184,15 @@ def _sglang_capture_mode() -> bool:
 
 
 class FiredCheck:
-    """Proof that every steered local site ran, per forward.
+    """Proof that every steered local site ran exactly once, per forward.
 
     Each site bumps a Python counter when it runs. ``wrap_forward`` puts a
     wrapper on the backbone INSTANCE's ``forward`` (SGLang also calls
     ``backbone.forward(...)`` directly, where a registered forward hook
     would not run). After each forward that runs Python (the warmup and
     every CUDA-graph capture at boot, and every eager forward) it raises if
-    a steered local site did not fire. A graph replay runs no Python, so
+    a steered local site did not fire, or fired more than once (the edit
+    applied twice). A graph replay runs no Python, so
     the check costs nothing there. Each forward inside a capture adds one
     entry to ``fired_at_capture``: the token count, the sites that fired
     and the sites expected.
@@ -238,6 +243,15 @@ class FiredCheck:
                 f"(layers {missing[:8]}{more}); the model reached them another way (for "
                 f"example two-batch overlap or a changed call style), so the steering would "
                 f"be skipped. Failing closed."
+            )
+        twice = [i for i in self.layer_ids if self.fired.get(i, 0) > 1]
+        if twice:
+            more = " ..." if len(twice) > 8 else ""
+            raise RuntimeError(
+                f"weightless: {len(twice)} {self.what}(s) ran more than once in this forward "
+                f"(layers {twice[:8]}{more}, {[self.fired[i] for i in twice[:8]]} times); the "
+                f"edit would be applied again to the edited stream (at alpha 2 a second "
+                f"reflection undoes the first). Failing closed."
             )
 
     def wrap_forward(self, module):
@@ -658,6 +672,127 @@ def make_post_layer_hook(owner, layer_id: int, next_layer_id=None, diag=None, ke
         out = list(output)
         out[hidden_index] = site(x, r)
         return tuple(out)
+
+    hook.site = site
+    return hook
+
+
+# ---------------------------------------------------------------- SGLang's stage-boundary layers
+# Upstream SGLang rebuilt its decoder-layer plumbing between 2026-09-24 and
+# 2026-09-30 (the "layer boundary" series: #41553 for Qwen3.5, #41554 and
+# #41750 for GLM-5.3-Flash's mHC). A layer built that way holds two
+# StageBoundary objects, ``attn_boundary`` and ``ffn_boundary``, each with the
+# ``declaration`` of its stage (the residual read and the residual update the
+# stage declares). Its forward returns the FFN's output ALONE; the residual it
+# is added to lives in ``forward_batch.residual_stream`` (a ResidualStream:
+# ``residual``, and ``pending``, the contribution whose update the next
+# stage's input applies). The plain add of that update is the next layer's
+# fused add+RMSNorm, as before, so the post-layer stream is still
+# ``output + residual``: the same point the (hidden, residual) pair gave.
+
+
+def uses_stage_boundaries(layer):
+    """True when ``layer`` holds any SGLang StageBoundary (whatever its
+    attribute names) or an ``attn_boundary`` / ``ffn_boundary`` attribute."""
+    d = getattr(layer, "__dict__", {})
+    return (any(type(v).__name__ == "StageBoundary" for v in d.values())
+            or "attn_boundary" in d or "ffn_boundary" in d)
+
+
+def stage_boundaries(layer):
+    """``(attn_boundary, ffn_boundary)`` when ``layer`` is built from SGLang's
+    stage boundaries, None when it holds none (the older layouts). Raises
+    when it holds them in a shape this plugin does not know (not that pair
+    of StageBoundary objects with a declared residual update each)."""
+    if not uses_stage_boundaries(layer):
+        return None
+    pair = []
+    for name in ("attn_boundary", "ffn_boundary"):
+        b = getattr(layer, name, None)
+        decl = getattr(b, "declaration", None)
+        if (type(b).__name__ != "StageBoundary" or decl is None
+                or getattr(decl, "update", None) is None):
+            raise RuntimeError(
+                f"weightless: decoder layer {getattr(layer, 'layer_id', '?')} "
+                f"({type(layer).__name__}) is built from stage boundaries, but its {name} is "
+                f"{type(b).__name__}, not a StageBoundary with a declared residual update; this "
+                f"SGLang layer layout is not one the plugin knows. Failing closed.")
+        pair.append(b)
+    return tuple(pair)
+
+
+_BATCH = []
+
+
+def _residual_batch():
+    """SGLang's residual-stream accessors (layer_boundary/residual/batch.py),
+    or None when this SGLang has none."""
+    if not _BATCH:
+        try:
+            from sglang.srt.layers.layer_boundary.residual import batch
+        except Exception:
+            batch = None
+        _BATCH.append(batch)
+    return _BATCH[0]
+
+
+def _forward_batch_of(args, kwargs):
+    fb = kwargs.get("forward_batch")
+    if fb is None:
+        fb = next((a for a in args if hasattr(a, "residual_stream")), None)
+    return fb
+
+
+def make_stream_hook(owner, layer_id: int, next_layer_id=None, diag=None, kernel="torch", *,
+                     width=None, check=None, row=None):
+    """A forward hook (``register_forward_hook(..., with_kwargs=True)``) for a
+    stage-boundary decoder layer ``layer_id`` (global id) whose FFN update is
+    the plain add: the residual-stream codec around ``make_site``.
+
+    After the layer, the forward batch's residual stream holds the layer's
+    output as its pending contribution and the residual it is added to. The
+    hook completes the output (``complete_output``: a sum the next input
+    would complete is completed here, the same collective), reads the
+    residual (``written_residual``), runs the edit with ``r`` = that
+    residual and writes x' into the output tensor in place, so the stream
+    still owns what the layer returns. Fails closed when the stream holds no
+    pending plain-add output, or one whose sum is declared for the receiver
+    of a pipeline handoff (completing it early would change what the
+    receiver adds).
+    """
+    site = make_site(owner, layer_id, next_layer_id=next_layer_id, diag=diag, kernel=kernel,
+                     width=width, check=check, row=row, hidden_slot="output",
+                     residual_slot="stream residual")
+    batch = _residual_batch()
+    where = f"weightless: row {row or 'unnamed'}, decoder layer {layer_id}"
+
+    def hook(module, args, kwargs, output):
+        if batch is None:
+            raise SiteError(f"{where}: the layer is built from stage boundaries but this SGLang "
+                            f"has no layer_boundary residual batch. Failing closed.")
+        fb = _forward_batch_of(args, kwargs)
+        stream = getattr(fb, "residual_stream", None)
+        pending = getattr(stream, "pending", None)
+        if pending is None:
+            raise SiteError(
+                f"{where}: after the layer, the forward batch's residual stream holds no pending "
+                f"output (forward_batch {'missing' if fb is None else 'found'}, stream "
+                f"{type(stream).__name__}); the layer did not leave its output for the next "
+                f"layer's add, so this site cannot edit it. Failing closed.")
+        upd = pending.update
+        if not getattr(upd, "is_plain_add", False) or getattr(upd, "applied_at_exit", False):
+            raise SiteError(
+                f"{where}: the layer's residual update is {type(upd).__name__}, not the plain add "
+                f"this row steers. Failing closed.")
+        if type(pending.owed).__name__ == "DeclaredSum":
+            raise SiteError(
+                f"{where}: the layer's output is a declared partial sum that the next stage "
+                f"(or a pipeline receiver) completes; steering it here would complete it early. "
+                f"Failing closed.")
+        x = batch.complete_output(output, fb)
+        x_new = site(x, batch.written_residual(fb))
+        x.copy_(x_new)
+        return x
 
     hook.site = site
     return hook
