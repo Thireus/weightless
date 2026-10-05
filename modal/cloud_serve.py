@@ -129,7 +129,9 @@ def ensure_dirs():
 
 
 @app.function(image=image, volumes={"/data": vol}, gpu=GPU,
-              min_containers=0, max_containers=1, scaledown_window=300,
+              # 30-min idle window: 300s made interactive clients flap
+              # orange — every ≥5-min gap cost a ~10-min cold wake
+              min_containers=0, max_containers=1, scaledown_window=1800,
               # BOTH startup_timeouts must cover a cold boot: this one gates
               # the runner-init phase that includes waiting for uvicorn to
               # bind (default 1800s killed the 2026-10-04 boot mid-compile

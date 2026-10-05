@@ -53,6 +53,11 @@ live in `BENCHMARK.md`; this file tracks what shipped.
   `K3_GPU` and `MAX_MODEL_LEN` (default 65536, unchanged) switches now reach
   the lockstep driver; previously the container env never received them.
 
+- **GLM-5.3 743B idle window 300s → 1800s**: a 5-min scale-down made
+  interactive clients flap — every short gap cost a ~10-min cold wake. 30
+  min covers real work-session gaps; trailing idle cost is bounded at one
+  extra half-hour per day of use.
+
 ## 2026-09-23
 
 ### Added
