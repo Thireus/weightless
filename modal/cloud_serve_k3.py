@@ -26,11 +26,20 @@ VOLUME_NAME = "kimi-k3"
 DIRS_PATH = "/data/out/k3-perlayer-dirs.pt"
 VECTOR_REPO = "msuiche/Kimi-K3-abliterated-cyber-GLP-92-L1-92-a1.0"
 VECTOR_FILE = "glp.kimi-k3.dirs.pt"
+# sha256 of the published glp.kimi-k3.dirs.pt — pinned so a truncated or
+# swapped artifact fails closed instead of steering with wrong directions.
+VECTOR_SHA256 = "5ebc5ce9168335d2b5e8048f2e0836778515932b5ca4209eb13deea27ab3da9b"
 PATCH_NAME = "hotfix-kimi-k3-steering-projective.py"
 DRIVER_NAME = "k3_serve_driver.py"
 EXPERIMENT = "refusal-research/experiments/20260903-kimi-k3-glp"
 ENV = {"HF_HOME": "/data/hf", "HF_XET_HIGH_PERFORMANCE": "1"}
 PY = "/usr/bin/python3.12"
+
+# Shape switches, read at deploy time (same convention as cloud_serve_glm53).
+# NOTE: max_containers=2 below means a traffic burst can run TWO 16-GPU
+# clusters (~$145/h combined) — deliberate experiment choice, not a cap.
+GPU = os.environ.get("K3_GPU", "H200:8")
+MAX_MODEL_LEN = os.environ.get("MAX_MODEL_LEN", "65536")
 
 app = modal.App("weightless-cloud-k3")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -53,10 +62,20 @@ def ensure_weights():
     """Resume/cache the ~1.56 TB snapshot on CPU; no GPU allocation.
 
     Fail-closed size-gate (METHODOLOGY section 16): 96 shards + index,
-    zero .incomplete blobs, >1.5 TB before any GPU spend."""
-    from huggingface_hub import snapshot_download
+    zero .incomplete blobs, >1.5 TB before any GPU spend.
 
-    snapshot = snapshot_download(MODEL_ID)
+    The weights repo is public: if the hf-token secret has gone stale, HF
+    rejects the request with a 401 instead of falling back to anonymous —
+    retry token-free so an expired secret can never block public weights
+    (the gated vector repo in ensure_dirs still needs a valid token)."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    try:
+        snapshot = snapshot_download(MODEL_ID)
+    except RepositoryNotFoundError:
+        print("hf-token rejected (401) — retrying anonymously", flush=True)
+        snapshot = snapshot_download(MODEL_ID, token=False)
     snap = Path(snapshot)
     shards = sorted(snap.glob("*.safetensors"))
     hub = Path(os.environ["HF_HOME"]) / "hub" / "models--moonshotai--Kimi-K3"
@@ -76,13 +95,17 @@ def ensure_weights():
               secrets=[modal.Secret.from_name("hf-token")], env=ENV)
 def ensure_dirs():
     """Verify the GLP-92 per-layer stack on the volume; fetch it from the
-    gated HF vector repo if missing. This serving lane never derives
-    directions."""
+    gated HF vector repo (pinned sha256) if missing. This serving lane never
+    derives directions."""
     dst = Path(DIRS_PATH)
     if not dst.is_file():
+        import hashlib
         from huggingface_hub import hf_hub_download
 
         fetched = hf_hub_download(repo_id=VECTOR_REPO, filename=VECTOR_FILE)
+        got = hashlib.sha256(Path(fetched).read_bytes()).hexdigest()
+        assert got == VECTOR_SHA256, \
+            f"{VECTOR_FILE} sha256 {got} != pinned {VECTOR_SHA256}"
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(Path(fetched).read_bytes())
         vol.commit()
@@ -91,7 +114,7 @@ def ensure_dirs():
     print("directions ready:", DIRS_PATH)
 
 
-@app.server(image=image, volumes={"/data": vol}, gpu="H200:8",
+@app.server(image=image, volumes={"/data": vol}, gpu=GPU,
             min_containers=0, max_containers=2, scaledown_window=600,
             startup_timeout=45 * 60, port=8000, unauthenticated=True,
             env=dict(ENV, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
@@ -105,6 +128,10 @@ def ensure_dirs():
                      # pynccl's torch symm-mem rendezvous cannot cross
                      # nodes on this TCP-only fabric (boots #2-#5)
                      VLLM_ALLREDUCE_USE_SYMM_MEM="0",
+                     # read at deploy time; the container's own env is the
+                     # only channel that reaches the driver (previously a
+                     # deploy-shell MAX_MODEL_LEN silently did nothing)
+                     MAX_MODEL_LEN=MAX_MODEL_LEN,
                      WEIGHTLESS_STEER_PATH=DIRS_PATH,
                      WEIGHTLESS_STEER_ALPHA=os.environ.get(
                          "WEIGHTLESS_STEER_ALPHA", "1.0")))

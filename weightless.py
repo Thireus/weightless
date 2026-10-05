@@ -29,7 +29,7 @@ COMMANDS = {
     "setup": ([PY, os.path.join(HERE, "setup.py")],
               "interactive setup wizard: lane pick → env → deploy → omp/hermes + tests"),
     "serve": ([PY, os.path.join(HERE, "setup.py"), "serve"],
-              "switch the rig to a lane, non-interactive: serve <name|#> [--skip-assets] [--skip-wait]"),
+              "switch the rig to a lane, non-interactive: serve <name|#> [--skip-assets] [--skip-wait] (cloud lanes: Modal deploy)"),
     "dash": ([PY, os.path.join(HERE, "scripts", "dash.py")],
              "live metrics for a serving lane (prefill/decode, queue, KV, spec decode)"),
     "test": (["bash", os.path.join(HERE, "tests", "smoke", "run.sh")],
