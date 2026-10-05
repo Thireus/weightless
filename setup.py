@@ -151,13 +151,15 @@ LANES = [
          hotfix="hotfix-glm53-steering-projective.py",
          extra_patches=["vendor/sparse_attn_indexer_kpool_sm121.py"],
          port=8080),
-    dict(name="GLM-5.3 743B — Modal cloud (8x H100, GLP-77 α=1.0)",
+    dict(name="GLM-5.3 743B — Modal cloud (8x B200, 1M ctx, GLP-77 α=1.0)",
          # Cloud lane: deploys via modal/cloud_serve.py and delivers an
          # endpoint URL. The on-prem 4x DGX recipe remains in recipe/glm53xl/.
+         # 1M ctx needs B200:8 (MLA KV is TP-replicated, ~90 GB/rank at 1M);
+         # H200:8 tops out ~880K — GLM53XL_GPU=H200:8 MAX_MODEL_LEN=880000.
          cloud="modal",
          modal_app="modal/cloud_serve.py",
          cloud_weights="~465 GB",
-         cloud_boot="30 min",
+         cloud_boot="60 min cold (first boot compiles; ~20 min warm)",
          example="recipe/glm53xl/.env.glm53xl.example",
          target="recipe/glm53xl/.env.glm53xl",
          steer_key="WEIGHTLESS_STEER_PATH",
@@ -224,6 +226,8 @@ LANES = [
          # Cloud lane: deploys via modal/cloud_serve_k3.py and delivers an
          # endpoint URL. The weights are ~1.56 TB (MXFP4 experts, no smaller
          # checkpoint exists); first ensure_weights run is the long pole.
+         # Shape switches at deploy time: K3_GPU, MAX_MODEL_LEN (default
+         # 65536), WEIGHTLESS_STEER_ALPHA.
          cloud="modal",
          modal_app="modal/cloud_serve_k3.py",
          cloud_weights="~1.56 TB",
@@ -2213,10 +2217,56 @@ def configure_serve_clients(io, base, model, values=None, ssh_host=None):
             io.warn(f"hermes config on {ssh_host} not updated")
 
 
+def quick_serve_cloud(io, lane_idx):
+    """Non-interactive Modal deploy for cloud lanes: weights → dirs → deploy.
+
+    Same modal commands as the wizard's cloud_chain, but ensure_weights runs
+    in the foreground instead of --detach: deploying against a half-cached
+    snapshot makes the serve container fail its boot and burn GPU on
+    restarts. WEIGHTLESS_STEER_ALPHA rides through the environment."""
+    lane = LANES[lane_idx]
+    app_path = os.path.join(HERE, lane["modal_app"])
+    weights_note = lane.get("cloud_weights", "~465 GB")
+    boot_note = lane.get("cloud_boot", "30 min")
+    io.header(lane["name"])
+    steps = [
+        ("check Modal auth", ["modal", "profile", "current"]),
+        (f"ensure weights on the volume ({weights_note} first time)",
+         ["modal", "run", app_path + "::ensure_weights"]),
+        ("verify the GLP directions on the volume (never re-derives)",
+         ["modal", "run", app_path + "::ensure_dirs"]),
+    ]
+    for desc, argv in steps:
+        io.info("$ " + shlex.join(argv))
+        if subprocess.call(argv) != 0:
+            io.err(f"FAILED: {desc}")
+            return 1
+    argv = ["modal", "deploy", app_path]
+    io.info("$ " + shlex.join(argv))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    print(r.stdout, r.stderr, sep="", end="")
+    if r.returncode != 0:
+        io.err(f"FAILED ({r.returncode}): modal deploy")
+        return r.returncode
+    m = re.search(r"https://\S+\.modal\.(?:run|direct)", r.stdout + r.stderr)
+    if not m:
+        io.warn("deployed, but the endpoint URL was not in the output — "
+                "check `modal app list`")
+        return 0
+    base = m.group(0).rstrip("/")
+    io.ok(f"deployed: {base}")
+    io.info("OpenAI-compatible endpoint: " + base + "/v1")
+    io.warn(f"cold start loads {weights_note} — first request can take up to "
+            f"{boot_note}; the endpoint 503s while booting")
+    return 0
+
+
 def quick_serve(io, lane_arg, skip_assets=False, skip_wait=False):
     """`setup.py serve <lane>` — non-interactive lane switch for the rig.
 
-    The lane's saved env is used as-is (the wizard owns env edits). Parks
+    Cloud lanes deploy to Modal instead (quick_serve_cloud) and skip all rig
+    steps. For rig lanes the lane's saved env is used as-is (the wizard owns
+    env edits). Parks
     whatever is serving — wizard lanes via CONTAINER_GREP plus known external
     stacks, which CONTAINER_GREP cannot see (a MiaAI dsv41-exl3 container
     holds :8888 invisibly to park_other_lanes) — syncs the recipe, boots, and
@@ -2268,8 +2318,7 @@ def quick_serve(io, lane_arg, skip_assets=False, skip_wait=False):
         io.err("NOT DEPLOYABLE — " + lane["blocked"])
         return 1
     if lane.get("cloud"):
-        io.err("cloud lanes deploy through the wizard (Modal), not serve")
-        return 1
+        return quick_serve_cloud(io, lane_idx)
     if not os.path.exists(os.path.join(HERE, lane["target"])):
         io.err(f"no saved env at {lane['target']} — run the wizard once first")
         return 1
@@ -2494,11 +2543,17 @@ def remote_diagnose(io, host):
     probe = (
         "echo '== containers =='; "
         "docker ps -a --format '{{.Names}} {{.Status}}' "
-        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron' || echo '(no serving container)'; "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless' || echo '(no serving container)'; "
         "echo '== restart-counts =='; "
         "docker inspect -f '{{.Name}} {{.State.Status}} restarts={{.RestartCount}}' "
         "$(docker ps -aq) 2>/dev/null "
-        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron' || true; "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless' || true; "
+        "echo '== wedge-signature =='; "
+        "for c in $(docker ps -aq --format '{{.Names}}' "
+        "| grep -i -E 'deepseek|qwen|vllm|inkling|glm|muse|nemotron|switchless'); do "
+        "docker logs --tail 300 $c 2>&1 "
+        "| grep -m2 -E 'ring transport failed|runtime poisoned|EngineDeadError|RPC call.*timed out' "
+        "| sed \"s|^|$c: |\"; done; true; "
         "echo '== fabric =='; "
         "ip -br addr 2>/dev/null | grep -E '192\\.168\\.100' || echo '(no fabric address on this node)'; "
         "echo '== peers =='; "
@@ -2530,6 +2585,14 @@ def remote_diagnose(io, host):
     if "(no fabric address on this node)" in out:
         io.err("fabric: this node has NO 192.168.100.x address — the inter-Spark "
                "link is down on this side (NO-CARRIER class)")
+    # Application wedge (2026-10-01): GPU work hangs (kda ring-transport wait
+    # timeout), workers exit cleanly, container shows Exited (0) — no watchdog,
+    # sysctl, or restart policy fires because the OS is healthy.
+    if "ring transport failed" in out or "EngineDeadError" in out:
+        io.err("application wedge: GPU work hung and the stack exited cleanly "
+               "(ring-transport / engine-RPC timeout signature) — the box is "
+               "healthy, so no self-healing fires. Relaunch the lane through "
+               "its start script (RoCE GIDs re-resolve there), NOT docker restart")
     down = [p for p in peers if f"{p} DOWN" in out]
     if down:
         io.err(f"peer(s) unreachable: {', '.join(down)} — the node is off or "

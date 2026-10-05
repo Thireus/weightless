@@ -4,6 +4,60 @@ Date-based sections — the repo has no versioned releases yet; captain-vector
 carries its own version numbers. Newest first. Steering-effectiveness numbers
 live in `BENCHMARK.md`; this file tracks what shipped.
 
+## 2026-10-04
+
+### Added
+- **`setup.py serve <lane>` deploys Modal cloud lanes non-interactively**
+  (previously wizard-only: "cloud lanes deploy through the wizard (Modal),
+  not serve"). Same modal commands as the wizard's cloud_chain, but
+  `ensure_weights` runs in the foreground instead of `--detach` — deploying
+  against a half-cached snapshot makes the serve container fail its boot and
+  burn GPU on restarts. Then `ensure_dirs`, `modal deploy`, and the endpoint
+  URL. `WEIGHTLESS_STEER_ALPHA` rides through the deploy-shell environment.
+- **GLM-5.3 743B lane self-heals its directions** (`modal/cloud_serve.py`):
+  when `/out/glm53-32perlayer-dirs.pt` is missing from the `glm53-nvfp4`
+  volume, `ensure_dirs` restores the validated GLP-77 .pt from
+  `msuiche/GLM-5.3-abliterated-cyber-GLP-77` with a pinned sha256 instead of
+  failing closed with manual-restore instructions. The .pt — the artifact the
+  serving hotfix actually consumes — is now published in the vector repo next
+  to the GGUF (the two files' byte hashes differ; GGUF container bytes are
+  not stable across exports).
+- **Cloud-lane drift closed** (`modal/cloud_serve.py`,
+  `modal/cloud_serve_k3.py`): both apps now share the same ensure pattern —
+  sha256-pinned direction restore (K3's `ensure_dirs` gained the pin the GLM
+  lane has) and a token-free retry on a 401 from a stale hf-token secret
+  (both weights repos are public; the gated vector repos still require a
+  valid token).
+- **GLM-5.3 743B boot loop fixed** (`modal/cloud_serve.py`): the serve
+  function lacked the sibling lanes' on-volume compile caches
+  (`TORCHINDUCTOR_CACHE_DIR`/`VLLM_CACHE_ROOT`/`TRITON_CACHE_DIR`), so the
+  first torch.compile (~20 min for 743B on 8 GPUs, after ~14 min of weight
+  load) blew past the 30-min web-server startup window and every restart
+  recompiled from scratch. Caches now on the volume; BOTH startup windows
+  raised to 60 min — the `@app.function(startup_timeout)` default (1800s)
+  gates the runner-init phase that includes waiting for uvicorn to bind and
+  killed one boot mid-compile even with `web_server(startup_timeout=3600)`
+  set (the Flash lane sets both; now this lane does too). First boot pays
+  the compile once; later boots reuse it.
+- **GLM-5.3 743B lane moved to B200:8 with the full 1M context**
+  (`modal/cloud_serve.py`, lane 4): MLA latent KV is TP-replicated
+  (~90 GB/rank at 1M tokens, bf16 — Hopper sparse-MLA rejects fp8 KV), so
+  1M does not fit on H100 (~220K) or H200 (~880K); B200's 192 GB leaves
+  ~110 GB free per rank after the 54.7 GiB weights, and FP4 runs native
+  instead of marlin emulation. New deploy-time switches:
+  `GLM53XL_GPU` (default `B200:8`) and `MAX_MODEL_LEN` (default `1048576`,
+  now actually passed through to the container — a deploy-shell override
+  previously did nothing). `GLM53XL_GPU=H200:8 MAX_MODEL_LEN=880000` is the
+  cheaper fallback shape.
+- **Kimi K3 lane env passthrough** (`modal/cloud_serve_k3.py`): deploy-time
+  `K3_GPU` and `MAX_MODEL_LEN` (default 65536, unchanged) switches now reach
+  the lockstep driver; previously the container env never received them.
+
+- **GLM-5.3 743B idle window 300s → 1800s**: a 5-min scale-down made
+  interactive clients flap — every short gap cost a ~10-min cold wake. 30
+  min covers real work-session gaps; trailing idle cost is bounded at one
+  extra half-hour per day of use.
+
 ## 2026-09-26
 
 ### Added
